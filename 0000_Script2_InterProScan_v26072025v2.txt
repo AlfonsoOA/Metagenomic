@@ -1,0 +1,195 @@
+#!/bin/bash
+set -euo pipefail
+
+# ========= 🔧 GENERAL CONFIGURATION =========
+
+FASTA="/home/alfonso/FASTA_InterProScan/00_MetaBAT2Refined-0.2.faa"
+CPU=7
+
+USE_INTERPRO_DOCKER="no"  # yes/no
+
+INTERPRO_DIR="/home/alfonso/FASTA_InterProScan/interproscan"
+WORKDIR="/home/alfonso/FASTA_InterProScan/install_tmp"
+OUTDIR="/home/alfonso/FASTA_InterProScan/FASTA_Annotations"
+
+USE_GOTERMS="yes"
+USE_PATHWAYS="yes"
+USE_IPRLOOKUP="yes"
+
+# ========= 📦 InterProScan archive settings =========
+IPS_VERSION="5.75-106.0"
+IPS_ARCHIVE="interproscan-${IPS_VERSION}-64-bit.tar.gz"
+IPS_URL="https://ftp.ebi.ac.uk/pub/software/unix/iprscan/5/${IPS_VERSION}/${IPS_ARCHIVE}"
+
+# ========= 🛠 FUNCTIONS =========
+
+build_interpro_options() {
+  local opts=""
+  [[ "$USE_GOTERMS" == "yes" ]] && opts+=" --goterms"
+  [[ "$USE_PATHWAYS" == "yes" ]] && opts+=" --pathways"
+  [[ "$USE_IPRLOOKUP" == "yes" ]] && opts+=" --iprlookup"
+  echo "$opts"
+}
+
+check_interproscan_folder() {
+  # Comprueba si la carpeta existe y no es vieja (>365 días)
+  if [[ ! -d "$INTERPRO_DIR" ]]; then
+    return 1
+  fi
+  local mod_days
+  mod_days=$(find "$INTERPRO_DIR" -maxdepth 0 -printf '%T@' | awk '{ print int((systime()-$1)/86400) }')
+  if (( mod_days > 365 )); then
+    return 1
+  fi
+  return 0
+}
+
+download_interproscan() {
+  mkdir -p "$WORKDIR"
+  cd "$WORKDIR"
+
+  if [[ ! -f "$IPS_ARCHIVE" ]]; then
+    echo "Downloading InterProScan archive from $IPS_URL ..."
+    curl -LO "$IPS_URL"
+  else
+    echo "InterProScan archive already downloaded."
+  fi
+
+  echo "Verifying gzip integrity of $IPS_ARCHIVE..."
+  if ! gzip -t "$IPS_ARCHIVE" 2>/dev/null; then
+    echo "❌ Archive corrupted. Re-downloading..."
+    rm -f "$IPS_ARCHIVE"
+    curl -LO "$IPS_URL"
+  fi
+}
+
+extract_interproscan() {
+  cd "$WORKDIR"
+
+  if [[ -d "$INTERPRO_DIR" ]]; then
+    echo "Removing old InterProScan directory..."
+    rm -rf "$INTERPRO_DIR"
+  fi
+
+  echo "Extracting InterProScan archive..."
+  tar -xzf "$IPS_ARCHIVE"
+
+  # La carpeta descomprimida tendrá este nombre:
+  local extracted_dir="interproscan-${IPS_VERSION}"
+
+  if [[ ! -d "$extracted_dir" ]]; then
+    echo "❌ Extraction failed: directory $extracted_dir not found after extraction."
+    exit 1
+  fi
+
+  # Mover la carpeta extraída a la ruta INTERPRO_DIR (solo si no está ahí ya)
+  mv "$extracted_dir" "$INTERPRO_DIR"
+  echo "✅ InterProScan extracted to $INTERPRO_DIR"
+}
+
+check_and_install_interproscan() {
+  if ! check_interproscan_folder; then
+    echo "InterProScan not found or outdated at $INTERPRO_DIR"
+    echo "Starting download and installation..."
+    download_interproscan
+    extract_interproscan
+  else
+    echo "InterProScan is already installed and up-to-date at $INTERPRO_DIR"
+  fi
+}
+
+prepare_workdirs() {
+  mkdir -p "$WORKDIR"
+  mkdir -p "$OUTDIR"
+}
+
+clean_fasta() {
+  local input_fasta="$1"
+  local output_fasta="$2"
+  echo "🧼 Cleaning FASTA file (removing asterisks '*')..."
+  sed 's/\*//g' "$input_fasta" > "$output_fasta"
+  echo "Cleaned FASTA saved at $output_fasta"
+}
+
+run_interproscan_local() {
+  local input_fasta="$1"
+  local output_base="$2"
+  local cpu="$3"
+  local options="$4"
+
+  if [[ ! -f "${output_base}.tsv" ]]; then
+    echo "🚀 Running InterProScan locally..."
+    "$INTERPRO_DIR/interproscan.sh" \
+      -i "$input_fasta" \
+      -f tsv,xml,gff3 \
+      -cpu "$cpu" \
+      $options \
+      -dp \
+      -b "$output_base"
+  else
+    echo "📁 InterProScan results already exist at ${output_base}.tsv – skipping run."
+  fi
+}
+
+generate_clean_csv() {
+  local input_tsv="$1"
+  local output_csv="$2"
+
+  if [[ -f "$output_csv" ]]; then
+    echo "✅ Cleaned CSV already exists: $output_csv – skipping."
+    return
+  fi
+
+  echo "🧽 Cleaning InterProScan TSV and creating CSV for enrichment analysis..."
+
+  awk -F'\t' 'BEGIN {
+    OFS=","; 
+    print "ProteinID","Database","Accession","Description","Start","End","E-value","Date","GO_terms","Pathways","InterPro_ID","InterPro_Desc"
+  }
+  $1 ~ /^[^|]/ {
+    print $1,$3,$4,$5,$6,$7,$8,$9,$13,$14,$11,$12
+  }' "$input_tsv" > "$output_csv"
+
+  echo "✅ Clean CSV created at: $output_csv"
+}
+
+# ========= 🚀 MAIN =========
+
+echo -e "\n--- Starting FASTA functional annotation with InterProScan ---"
+echo "Input FASTA: $FASTA"
+echo "CPUs to use: $CPU"
+echo "Using Docker: $USE_INTERPRO_DOCKER"
+echo "InterProScan directory: $INTERPRO_DIR"
+echo "Working directory (install/tmp): $WORKDIR"
+echo "Output directory: $OUTDIR"
+
+prepare_workdirs
+
+FASTA_BASENAME=$(basename "${FASTA%.*}")
+CLEAN_FASTA="$OUTDIR/${FASTA_BASENAME}_clean.faa"
+TSV_OUT="$OUTDIR/${FASTA_BASENAME}_results.tsv"
+CSV_OUT="$OUTDIR/${FASTA_BASENAME}_results_clean.csv"
+
+clean_fasta "$FASTA" "$CLEAN_FASTA"
+
+if [[ "$USE_INTERPRO_DOCKER" == "no" ]]; then
+  check_and_install_interproscan
+fi
+
+INTERPRO_OPTS=$(build_interpro_options)
+echo "InterProScan options: $INTERPRO_OPTS"
+
+echo -e "\n--- Running InterProScan ---"
+if [[ "$USE_INTERPRO_DOCKER" == "yes" ]]; then
+  echo "🛑 Docker execution not implemented in this version."
+  exit 1
+else
+  run_interproscan_local "$CLEAN_FASTA" "${OUTDIR}/${FASTA_BASENAME}_results" "$CPU" "$INTERPRO_OPTS"
+fi
+
+generate_clean_csv "$TSV_OUT" "$CSV_OUT"
+
+echo -e "\n🎉 Annotation pipeline finished."
+echo "Final cleaned CSV ready for enrichment: $CSV_OUT"
+
+exit 0
